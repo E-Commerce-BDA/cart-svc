@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -18,8 +19,10 @@ import type {
   CartIdentity,
   CartRequest,
 } from '../auth/guards/cart-identity.guard.js';
+import { CartMergeService } from './cart-merge.service.js';
 import { CartService } from './cart.service.js';
 import type {
+  CartMergeResponse,
   CartMutationResponse,
   CartResponse,
 } from './cart.types.js';
@@ -32,11 +35,37 @@ import { IdempotencyInterceptor } from './idempotency.interceptor.js';
 @UseGuards(CartIdentityGuard)
 @UseInterceptors(IdempotencyInterceptor)
 export class CartController {
-  constructor(private readonly cartService: CartService) {}
+  constructor(
+    private readonly cartService: CartService,
+    private readonly cartMergeService: CartMergeService,
+  ) {}
 
   @Get()
   getCart(@Req() request: CartRequest): Promise<CartResponse> {
     return this.cartService.getCart(requireIdentity(request));
+  }
+
+  @Post('merge')
+  @HttpCode(200)
+  mergeCart(@Req() request: CartRequest): Promise<CartMergeResponse> {
+    const identity = requireIdentity(request);
+    if (identity.type !== 'user') {
+      throw new UnauthorizedException(
+        'A verified user token is required for merge',
+      );
+    }
+
+    if (!request.guestSessionId) {
+      throw new BadRequestException({
+        code: 'VALIDATION_FAILED',
+        message: 'x-session-id is required for merge',
+      });
+    }
+
+    return this.cartMergeService.merge(
+      identity.userId,
+      request.guestSessionId,
+    );
   }
 
   @Post('items')
