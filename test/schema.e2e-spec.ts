@@ -30,7 +30,7 @@ describe('Cart Schema (e2e)', () => {
     await closePool();
   });
 
-  it('1. 4 base tables exist in cart schema', async () => {
+  it('1. 6 base tables exist in cart schema', async () => {
     const { rows } = await client.query<{ table_name: string }>(
       `SELECT table_name 
        FROM information_schema.tables 
@@ -42,6 +42,8 @@ describe('Cart Schema (e2e)', () => {
     expect(tableNames).toEqual([
       'cart_items',
       'carts',
+      'settings',
+      'settings_audit',
       'wishlist_items',
       'wishlists',
     ]);
@@ -57,12 +59,15 @@ describe('Cart Schema (e2e)', () => {
     const indexNames = rows.map((r) => r.indexname);
     const expectedIndexes = [
       'one_active_cart_per_user',
+      'one_active_cart_per_session',
       'idx_carts_session_id',
       'idx_carts_abandoned',
       'cart_items_cart_product_unique',
       'idx_cart_items_product_id',
       'idx_wishlist_items_wishlist_id',
       'wishlist_items_unique',
+      'idx_cart_settings_audit_scope_changed_at',
+      'idx_cart_settings_audit_changed_by',
     ];
 
     for (const expected of expectedIndexes) {
@@ -225,5 +230,91 @@ describe('Cart Schema (e2e)', () => {
     expect(new Date(updated.updated_at).getTime()).toBeGreaterThan(
       new Date(pastTimestamp).getTime(),
     );
+  });
+
+  it('10. seeds the global settings document with an object payload', async () => {
+    const { rows } = await client.query<{
+      scope: string;
+      setting_values: Record<string, unknown>;
+      version: number;
+    }>(
+      `SELECT scope, setting_values, version
+         FROM cart.settings
+        WHERE scope = 'global'`,
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].scope).toBe('global');
+    expect(rows[0].setting_values).toEqual(expect.any(Object));
+    expect(Array.isArray(rows[0].setting_values)).toBe(false);
+    expect(rows[0].version).toBeGreaterThanOrEqual(0);
+  });
+
+  it('11. enforces settings_setting_values_object_check', async () => {
+    await client.query('SAVEPOINT sp_settings_shape');
+    try {
+      await expect(
+        client.query(
+          `UPDATE cart.settings
+              SET setting_values = '[]'::jsonb
+            WHERE scope = 'global'`,
+        ),
+      ).rejects.toThrow(
+        /violates check constraint "settings_setting_values_object_check"/,
+      );
+    } finally {
+      await client.query('ROLLBACK TO SAVEPOINT sp_settings_shape');
+    }
+  });
+
+  it('12. refreshes settings.updated_at via trigger', async () => {
+    const pastTimestamp = '2000-01-01T00:00:00Z';
+
+    await client.query('SAVEPOINT sp_settings_trigger');
+    try {
+      const { rows } = await client.query<{ updated_at: string }>(
+        `UPDATE cart.settings
+            SET setting_values = '{"guestMergeStrategy":"guest_wins"}'::jsonb,
+                updated_at = $1
+          WHERE scope = 'global'
+          RETURNING updated_at`,
+        [pastTimestamp],
+      );
+
+      expect(new Date(rows[0].updated_at).getTime()).toBeGreaterThan(
+        new Date(pastTimestamp).getTime(),
+      );
+    } finally {
+      await client.query('ROLLBACK TO SAVEPOINT sp_settings_trigger');
+    }
+  });
+
+  it('13. enforces single active cart per guest session', async () => {
+    const sessionId = `sess_${randomUUID()}`;
+
+    await client.query(
+      `INSERT INTO cart.carts (session_id, status) VALUES ($1, 'active')`,
+      [sessionId],
+    );
+
+    await client.query('SAVEPOINT sp_guest_session');
+    try {
+      await expect(
+        client.query(
+          `INSERT INTO cart.carts (session_id, status) VALUES ($1, 'active')`,
+          [sessionId],
+        ),
+      ).rejects.toThrow(
+        /violates unique constraint "one_active_cart_per_session"/,
+      );
+    } finally {
+      await client.query('ROLLBACK TO SAVEPOINT sp_guest_session');
+    }
+
+    const abandoned = await client.query(
+      `INSERT INTO cart.carts (session_id, status) VALUES ($1, 'abandoned') RETURNING id`,
+      [sessionId],
+    );
+    expect(abandoned.rows[0].id).toBeDefined();
   });
 });
