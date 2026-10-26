@@ -37,3 +37,7 @@ export interface CartMutationResponse {
   item: CartItemDto;
   cartTotals: CartTotals;
 }
+
+export interface CartMergeResponse {
+  cart: CartDto;
+}
