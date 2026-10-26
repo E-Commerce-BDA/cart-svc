@@ -6,18 +6,10 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Request } from 'express';
-import {
-  JWT_ALGORITHM,
-  JWT_AUDIENCE,
-  JWT_CLOCK_TOLERANCE_SECONDS,
-  JWT_ISSUER,
-} from '../auth.constants.js';
+import { verifyAccessToken } from '../access-token.js';
+import type { AuthenticatedUser } from '../access-token.js';
 
-export interface AuthenticatedUser {
-  sub: string;
-  email: string;
-  roles: string[];
-}
+export type { AuthenticatedUser } from '../access-token.js';
 
 export interface AuthenticatedRequest extends Request {
   user?: AuthenticatedUser;
@@ -43,16 +35,7 @@ export class JwtAuthGuard implements CanActivate {
     }
 
     try {
-      const payload = await this.jwtService.verifyAsync<AuthenticatedUser>(
-        token,
-        {
-          issuer: JWT_ISSUER,
-          audience: JWT_AUDIENCE,
-          algorithms: [JWT_ALGORITHM],
-          clockTolerance: JWT_CLOCK_TOLERANCE_SECONDS,
-        },
-      );
-      request.user = payload;
+      request.user = await verifyAccessToken(this.jwtService, token);
       return true;
     } catch {
       throw new UnauthorizedException('Invalid or expired access token');
