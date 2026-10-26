@@ -17,24 +17,21 @@ function row(overrides: Partial<SettingsRow> = {}): SettingsRow {
   };
 }
 
-function makeRepository(): SettingsRepository {
-  return {
-    find: vi.fn(),
-    save: vi.fn(),
-  } as unknown as SettingsRepository;
-}
-
 describe('SettingsService', () => {
   let repository: SettingsRepository;
+  let find: ReturnType<typeof vi.fn>;
+  let save: ReturnType<typeof vi.fn>;
   let service: SettingsService;
 
   beforeEach(() => {
-    repository = makeRepository();
+    find = vi.fn();
+    save = vi.fn();
+    repository = { find, save } as unknown as SettingsRepository;
     service = new SettingsService(repository);
   });
 
   it('returns defaults plus admin definitions', async () => {
-    vi.mocked(repository.find).mockResolvedValue(row());
+    find.mockResolvedValue(row());
 
     const result = await service.getSettings();
 
@@ -45,7 +42,7 @@ describe('SettingsService', () => {
   });
 
   it('returns a valid stored override', async () => {
-    vi.mocked(repository.find).mockResolvedValue(
+    find.mockResolvedValue(
       row({ setting_values: { guestMergeStrategy: 'guest_wins' } }),
     );
 
@@ -58,7 +55,7 @@ describe('SettingsService', () => {
   });
 
   it('ignores invalid or unknown stored keys', async () => {
-    vi.mocked(repository.find).mockResolvedValue(
+    find.mockResolvedValue(
       row({
         setting_values: {
           guestMergeStrategy: 'not-a-policy',
@@ -74,8 +71,8 @@ describe('SettingsService', () => {
   });
 
   it('saves a valid override and returns the new version', async () => {
-    vi.mocked(repository.find).mockResolvedValue(row());
-    vi.mocked(repository.save).mockResolvedValue({
+    find.mockResolvedValue(row());
+    save.mockResolvedValue({
       kind: 'saved',
       row: row({
         setting_values: { guestMergeStrategy: 'guest_wins' },
@@ -91,7 +88,7 @@ describe('SettingsService', () => {
       requestId: 'req-1',
     });
 
-    expect(repository.save).toHaveBeenCalledWith({
+    expect(save).toHaveBeenCalledWith({
       scope: 'global',
       expectedVersion: 4,
       values: { guestMergeStrategy: 'guest_wins' },
@@ -106,10 +103,10 @@ describe('SettingsService', () => {
   });
 
   it('deletes a reset key from the stored overrides', async () => {
-    vi.mocked(repository.find).mockResolvedValue(
+    find.mockResolvedValue(
       row({ setting_values: { guestMergeStrategy: 'guest_wins' } }),
     );
-    vi.mocked(repository.save).mockResolvedValue({
+    save.mockResolvedValue({
       kind: 'saved',
       row: row({ version: 5 }),
     });
@@ -121,17 +118,17 @@ describe('SettingsService', () => {
       requestId: 'req-2',
     });
 
-    expect(repository.save).toHaveBeenCalledWith(
+    expect(save).toHaveBeenCalledWith(
       expect.objectContaining({ values: {} }),
     );
     expect(result.values).toEqual({ guestMergeStrategy: 'merge' });
   });
 
   it('preserves unknown stored keys for rollback safety', async () => {
-    vi.mocked(repository.find).mockResolvedValue(
+    find.mockResolvedValue(
       row({ setting_values: { futureSetting: true } }),
     );
-    vi.mocked(repository.save).mockResolvedValue({
+    save.mockResolvedValue({
       kind: 'saved',
       row: row({
         setting_values: {
@@ -149,7 +146,7 @@ describe('SettingsService', () => {
       requestId: 'req-3',
     });
 
-    expect(repository.save).toHaveBeenCalledWith(
+    expect(save).toHaveBeenCalledWith(
       expect.objectContaining({
         values: {
           futureSetting: true,
@@ -160,8 +157,8 @@ describe('SettingsService', () => {
   });
 
   it('returns 409 details when the version is stale', async () => {
-    vi.mocked(repository.find).mockResolvedValue(row());
-    vi.mocked(repository.save).mockResolvedValue({
+    find.mockResolvedValue(row());
+    save.mockResolvedValue({
       kind: 'conflict',
       currentVersion: 5,
     });
@@ -197,7 +194,7 @@ describe('SettingsService', () => {
       code: 'UNKNOWN_SETTING',
       details: { key: 'notASetting' },
     });
-    expect(repository.find).not.toHaveBeenCalled();
+    expect(find).not.toHaveBeenCalled();
   });
 
   it('rejects prototype-pollution keys', async () => {
@@ -268,7 +265,7 @@ describe('SettingsService', () => {
   });
 
   it('fails closed when the settings row is missing', async () => {
-    vi.mocked(repository.find).mockResolvedValue(null);
+    find.mockResolvedValue(null);
 
     await expect(service.getSettings()).rejects.toBeInstanceOf(
       InternalServerErrorException,
