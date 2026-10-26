@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { PoolClient } from 'pg';
 import type { CartIdentity } from '../auth/guards/cart-identity.guard.js';
 import { getPool } from '../db/pool.js';
+import type { GuestMergeStrategy } from '../settings/settings.registry.js';
 import type { CatalogProductSnapshot } from './catalog.client.js';
 
 export interface CartRow {
@@ -36,6 +37,11 @@ export interface ItemMutation {
 export interface DeleteMutation {
   deletedCount: number;
   cart: CartRow | null;
+}
+
+export interface MergeResult {
+  cart: CartRow;
+  changed: boolean;
 }
 
 const CART_COLUMNS = `id, user_id, session_id, status, last_activity_at, created_at, updated_at`;
@@ -201,6 +207,97 @@ export class CartRepository {
     });
   }
 
+  async mergeActiveCarts(
+    userId: string,
+    sessionId: string,
+    policy: GuestMergeStrategy,
+  ): Promise<MergeResult> {
+    try {
+      return await this.runMerge(userId, sessionId, policy);
+    } catch (error) {
+      // A concurrent user-cart creation can win the partial unique index
+      // between our lock query and adoption. Retry once so the merge sees the
+      // committed winner instead of returning a 500.
+      if (!isUniqueViolation(error)) {
+        throw error;
+      }
+      return this.runMerge(userId, sessionId, policy);
+    }
+  }
+
+  private async runMerge(
+    userId: string,
+    sessionId: string,
+    policy: GuestMergeStrategy,
+  ): Promise<MergeResult> {
+    return this.withTransaction(async (client) => {
+      const { rows } = await client.query<CartRow>(
+        `SELECT ${CART_COLUMNS}
+           FROM cart.carts
+          WHERE status = 'active'
+            AND (user_id = $1 OR session_id = $2)
+          ORDER BY id
+          FOR UPDATE`,
+        [userId, sessionId],
+      );
+
+      const userCart = rows.find((cart) => cart.user_id === userId) ?? null;
+      const guestCart =
+        rows.find(
+          (cart) =>
+            cart.session_id === sessionId && cart.id !== userCart?.id,
+        ) ?? null;
+
+      if (!guestCart) {
+        if (userCart) {
+          return { cart: userCart, changed: false };
+        }
+
+        const created = await this.insertUserCart(client, userId);
+        return { cart: created, changed: false };
+      }
+
+      const counts = await this.countItems(client, [
+        userCart?.id ?? null,
+        guestCart.id,
+      ]);
+      const userHasItems = userCart
+        ? (counts.get(userCart.id) ?? 0) > 0
+        : false;
+      const guestHasItems = (counts.get(guestCart.id) ?? 0) > 0;
+      const adoptGuest = shouldAdoptGuest(
+        policy,
+        userCart !== null,
+        userHasItems,
+        guestHasItems,
+      );
+
+      if (adoptGuest) {
+        if (userCart) {
+          await this.convertCart(client, userCart.id);
+        }
+
+        const adopted = await this.reassignGuestCart(
+          client,
+          guestCart.id,
+          userId,
+        );
+        return { cart: adopted, changed: true };
+      }
+
+      const target =
+        userCart ?? (await this.insertUserCart(client, userId));
+
+      if (policy === 'merge' && userHasItems && guestHasItems) {
+        await this.mergeGuestItems(client, target.id, guestCart.id);
+      }
+
+      await this.convertCart(client, guestCart.id);
+      const touched = await this.touchCart(client, target.id);
+      return { cart: touched, changed: true };
+    });
+  }
+
   private async insertActiveCart(identity: CartIdentity): Promise<CartRow> {
     const userId = identity.type === 'user' ? identity.userId : null;
     const sessionId =
@@ -214,6 +311,123 @@ export class CartRepository {
     );
 
     return rows[0];
+  }
+
+  private async insertUserCart(
+    client: PoolClient,
+    userId: string,
+  ): Promise<CartRow> {
+    const { rows } = await client.query<CartRow>(
+      `INSERT INTO cart.carts (user_id)
+       VALUES ($1)
+       ON CONFLICT DO NOTHING
+       RETURNING ${CART_COLUMNS}`,
+      [userId],
+    );
+
+    if (rows[0]) {
+      return rows[0];
+    }
+
+    const existing = await this.findActiveUserCart(client, userId);
+    if (!existing) {
+      throw new Error(`Could not create an active cart for user ${userId}`);
+    }
+
+    return existing;
+  }
+
+  private async findActiveUserCart(
+    client: PoolClient,
+    userId: string,
+  ): Promise<CartRow | null> {
+    const { rows } = await client.query<CartRow>(
+      `SELECT ${CART_COLUMNS}
+         FROM cart.carts
+        WHERE user_id = $1
+          AND status = 'active'
+        LIMIT 1`,
+      [userId],
+    );
+
+    return rows[0] ?? null;
+  }
+
+  private async countItems(
+    client: PoolClient,
+    cartIds: Array<string | null>,
+  ): Promise<Map<string, number>> {
+    const ids = cartIds.filter((id): id is string => id !== null);
+    if (ids.length === 0) {
+      return new Map();
+    }
+
+    const { rows } = await client.query<{
+      cart_id: string;
+      item_count: number;
+    }>(
+      `SELECT cart_id, count(*)::int AS item_count
+         FROM cart.cart_items
+        WHERE cart_id = ANY($1::uuid[])
+        GROUP BY cart_id`,
+      [ids],
+    );
+
+    return new Map(rows.map((row) => [row.cart_id, row.item_count]));
+  }
+
+  private async convertCart(
+    client: PoolClient,
+    cartId: string,
+  ): Promise<void> {
+    await client.query(
+      `UPDATE cart.carts
+          SET status = 'converted'
+        WHERE id = $1`,
+      [cartId],
+    );
+  }
+
+  private async reassignGuestCart(
+    client: PoolClient,
+    cartId: string,
+    userId: string,
+  ): Promise<CartRow> {
+    const { rows } = await client.query<CartRow>(
+      `UPDATE cart.carts
+          SET user_id = $1,
+              session_id = NULL,
+              last_activity_at = now()
+        WHERE id = $2
+        RETURNING ${CART_COLUMNS}`,
+      [userId, cartId],
+    );
+
+    const cart = rows[0];
+    if (!cart) {
+      throw new Error(`Guest cart ${cartId} disappeared during merge`);
+    }
+
+    return cart;
+  }
+
+  private async mergeGuestItems(
+    client: PoolClient,
+    targetCartId: string,
+    guestCartId: string,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO cart.cart_items
+         (cart_id, product_id, variant_id, qty, unit_price, product_name,
+          product_slug, image_url, variant_label, added_at)
+       SELECT $1, product_id, variant_id, qty, unit_price, product_name,
+              product_slug, image_url, variant_label, added_at
+         FROM cart.cart_items
+        WHERE cart_id = $2
+       ON CONFLICT (cart_id, product_id, variant_id)
+       DO UPDATE SET qty = cart.cart_items.qty + EXCLUDED.qty`,
+      [targetCartId, guestCartId],
+    );
   }
 
   private async touchCart(
@@ -253,6 +467,23 @@ export class CartRepository {
       client.release();
     }
   }
+}
+
+function shouldAdoptGuest(
+  policy: GuestMergeStrategy,
+  hasUserCart: boolean,
+  userHasItems: boolean,
+  guestHasItems: boolean,
+): boolean {
+  if (!guestHasItems) {
+    return false;
+  }
+
+  if (!hasUserCart || policy === 'guest_wins') {
+    return true;
+  }
+
+  return !userHasItems;
 }
 
 function isUniqueViolation(error: unknown): boolean {
