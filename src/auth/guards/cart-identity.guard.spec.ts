@@ -31,6 +31,25 @@ describe('CartIdentityGuard', () => {
     expect(request.user?.sub).toBe('user-1');
   });
 
+  it('keeps the guest session alongside a verified user for merge', async () => {
+    verifyAsync.mockResolvedValue({
+      sub: 'user-1',
+      email: 'shopper@example.com',
+      roles: ['customer'],
+    });
+    const request = {
+      headers: {
+        authorization: 'Bearer token',
+        'x-session-id': 'guest-session-1',
+      },
+    } as unknown as CartRequest;
+
+    await expect(guard.canActivate(context(request))).resolves.toBe(true);
+
+    expect(request.cartIdentity).toEqual({ type: 'user', userId: 'user-1' });
+    expect(request.guestSessionId).toBe('guest-session-1');
+  });
+
   it('uses the x-session-id header for a guest', async () => {
     const request = {
       headers: { 'x-session-id': 'guest-session-1' },
