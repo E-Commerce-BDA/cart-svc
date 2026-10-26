@@ -3,7 +3,8 @@ import type { EventBus } from '../events/event-bus.js';
 import type { CatalogClient } from './catalog.client.js';
 import { FIXTURE_PRODUCTS } from './catalog.client.js';
 import type { CartRepository, CartItemRow, CartRow } from './cart.repository.js';
-import { CartService, computeTotals } from './cart.service.js';
+import { computeTotals } from './cart.mapper.js';
+import { CartService } from './cart.service.js';
 
 const TEE = FIXTURE_PRODUCTS[0];
 const MUG = FIXTURE_PRODUCTS[1];
