@@ -14,6 +14,14 @@ describe('Cart Schema (e2e)', () => {
     await client.query('BEGIN');
   });
 
+  beforeEach(async () => {
+    await client.query('SAVEPOINT test_sp');
+  });
+
+  afterEach(async () => {
+    await client.query('ROLLBACK TO SAVEPOINT test_sp');
+  });
+
   afterAll(async () => {
     if (client) {
       await client.query('ROLLBACK');
@@ -90,12 +98,17 @@ describe('Cart Schema (e2e)', () => {
     );
 
     // Second active cart for the same user should violate unique constraint
-    await expect(
-      client.query(
-        `INSERT INTO cart.carts (user_id, status) VALUES ($1, 'active')`,
-        [userId],
-      ),
-    ).rejects.toThrow(/violates unique constraint "one_active_cart_per_user"/);
+    await client.query('SAVEPOINT sp5');
+    try {
+      await expect(
+        client.query(
+          `INSERT INTO cart.carts (user_id, status) VALUES ($1, 'active')`,
+          [userId],
+        ),
+      ).rejects.toThrow(/violates unique constraint "one_active_cart_per_user"/);
+    } finally {
+      await client.query('ROLLBACK TO SAVEPOINT sp5');
+    }
 
     // But an abandoned cart for the same user is permitted
     const res = await client.query(
@@ -113,22 +126,32 @@ describe('Cart Schema (e2e)', () => {
     const productId = randomUUID();
 
     // Negative qty
-    await expect(
-      client.query(
-        `INSERT INTO cart.cart_items (cart_id, product_id, qty, unit_price, product_name)
-         VALUES ($1, $2, 0, 19.99, 'Test Product')`,
-        [cartId, productId],
-      ),
-    ).rejects.toThrow(/violates check constraint "cart_items_qty_check"/);
+    await client.query('SAVEPOINT sp6_qty');
+    try {
+      await expect(
+        client.query(
+          `INSERT INTO cart.cart_items (cart_id, product_id, qty, unit_price, product_name)
+           VALUES ($1, $2, 0, 19.99, 'Test Product')`,
+          [cartId, productId],
+        ),
+      ).rejects.toThrow(/violates check constraint "cart_items_qty_check"/);
+    } finally {
+      await client.query('ROLLBACK TO SAVEPOINT sp6_qty');
+    }
 
     // Negative unit_price
-    await expect(
-      client.query(
-        `INSERT INTO cart.cart_items (cart_id, product_id, qty, unit_price, product_name)
-         VALUES ($1, $2, 1, -5.00, 'Test Product')`,
-        [cartId, productId],
-      ),
-    ).rejects.toThrow(/violates check constraint "cart_items_unit_price_check"/);
+    await client.query('SAVEPOINT sp6_price');
+    try {
+      await expect(
+        client.query(
+          `INSERT INTO cart.cart_items (cart_id, product_id, qty, unit_price, product_name)
+           VALUES ($1, $2, 1, -5.00, 'Test Product')`,
+          [cartId, productId],
+        ),
+      ).rejects.toThrow(/violates check constraint "cart_items_unit_price_check"/);
+    } finally {
+      await client.query('ROLLBACK TO SAVEPOINT sp6_price');
+    }
   });
 
   it('7. enforces unique cart items per variant including NULL variant (NULLS NOT DISTINCT)', async () => {
@@ -182,26 +205,25 @@ describe('Cart Schema (e2e)', () => {
   });
 
   it('9. updates updated_at via trigger on cart modification', async () => {
+    const pastTimestamp = '2000-01-01T00:00:00Z';
     const cartRes = await client.query(
-      `INSERT INTO cart.carts (session_id) VALUES ('sess_trigger') RETURNING id, updated_at`,
+      `INSERT INTO cart.carts (session_id, created_at, updated_at) 
+       VALUES ('sess_trigger', $1, $1) RETURNING id, created_at, updated_at`,
+      [pastTimestamp],
     );
     const cartId = cartRes.rows[0].id;
-    const initialUpdatedAt = new Date(cartRes.rows[0].updated_at).getTime();
 
-    // Sleep 15ms so timestamp advances
-    await new Promise((r) => setTimeout(r, 15));
-
-    await client.query(
-      `UPDATE cart.carts SET status = 'abandoned' WHERE id = $1`,
+    const updateRes = await client.query(
+      `UPDATE cart.carts SET status = 'abandoned' WHERE id = $1 RETURNING created_at, updated_at`,
       [cartId],
     );
+    const updated = updateRes.rows[0];
 
-    const updatedRes = await client.query(
-      `SELECT updated_at FROM cart.carts WHERE id = $1`,
-      [cartId],
+    expect(new Date(updated.created_at).toISOString()).toBe(
+      new Date(pastTimestamp).toISOString(),
     );
-    const newUpdatedAt = new Date(updatedRes.rows[0].updated_at).getTime();
-
-    expect(newUpdatedAt).toBeGreaterThan(initialUpdatedAt);
+    expect(new Date(updated.updated_at).getTime()).toBeGreaterThan(
+      new Date(pastTimestamp).getTime(),
+    );
   });
 });
