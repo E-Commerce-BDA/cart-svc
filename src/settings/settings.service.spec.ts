@@ -70,6 +70,16 @@ describe('SettingsService', () => {
     expect(result.overrides).toEqual({});
   });
 
+  it('reads the effective merge strategy at merge time', async () => {
+    find.mockResolvedValue(
+      row({ setting_values: { guestMergeStrategy: 'guest_wins' } }),
+    );
+
+    await expect(service.getGuestMergeStrategy()).resolves.toBe(
+      'guest_wins',
+    );
+  });
+
   it('saves a valid override and returns the new version', async () => {
     find.mockResolvedValue(row());
     save.mockResolvedValue({
