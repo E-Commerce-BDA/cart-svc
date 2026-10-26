@@ -16,6 +16,7 @@ import {
   SettingKey,
   SettingValue,
   SettingValues,
+  type GuestMergeStrategy,
 } from './settings.registry.js';
 
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -51,6 +52,11 @@ export class SettingsService {
       ...this.toDocument(row),
       definitions: getSettingDefinitions(),
     };
+  }
+
+  async getGuestMergeStrategy(): Promise<GuestMergeStrategy> {
+    const row = await this.requireRow();
+    return this.toDocument(row).values.guestMergeStrategy;
   }
 
   async updateSettings(
