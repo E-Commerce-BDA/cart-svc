@@ -9,10 +9,8 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Roles } from '../auth/decorators/roles.decorator.js';
-import {
-  AuthenticatedRequest,
-  JwtAuthGuard,
-} from '../auth/guards/jwt-auth.guard.js';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
+import type { AuthenticatedRequest } from '../auth/guards/jwt-auth.guard.js';
 import { RolesGuard } from '../auth/guards/roles.guard.js';
 import { getRequestId } from '../common/http/request-id.js';
 import { UpdateSettingsDto } from './dto/update-settings.dto.js';
