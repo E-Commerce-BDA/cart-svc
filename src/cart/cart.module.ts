@@ -5,6 +5,7 @@ import { HttpExceptionFilter } from '../common/filters/http-exception.filter.js'
 import { EVENT_BUS, NoopEventBus } from '../events/event-bus.js';
 import { RedisModule } from '../redis/redis.module.js';
 import { SettingsModule } from '../settings/settings.module.js';
+import { CartMergeService } from './cart-merge.service.js';
 import { CartController } from './cart.controller.js';
 import { CartRepository } from './cart.repository.js';
 import { CartService } from './cart.service.js';
@@ -17,6 +18,7 @@ import { IdempotencyService } from './idempotency.service.js';
   controllers: [CartController],
   providers: [
     CartService,
+    CartMergeService,
     CartRepository,
     IdempotencyService,
     IdempotencyInterceptor,
