@@ -9,6 +9,28 @@ export interface SettingsRow {
   updated_at: Date;
 }
 
+export interface SettingsAuditRow {
+  id: string;
+  scope: string;
+  version: number;
+  old_values: Record<string, unknown> | null;
+  new_values: Record<string, unknown>;
+  changed_by: string | null;
+  request_id: string | null;
+  changed_at: Date;
+}
+
+export interface SettingsAuditEntry {
+  id: string;
+  scope: string;
+  version: number;
+  oldValues: Record<string, unknown> | null;
+  newValues: Record<string, unknown>;
+  changedBy: string | null;
+  requestId: string | null;
+  changedAt: string;
+}
+
 export interface SaveSettingsInput {
   scope: string;
   expectedVersion: number;
@@ -33,6 +55,39 @@ export class SettingsRepository {
     );
 
     return rows[0] ?? null;
+  }
+
+  async findAuditEntries(
+    scope?: string,
+    limit: number = 50,
+  ): Promise<SettingsAuditEntry[]> {
+    const query = scope
+      ? `SELECT id, scope, version, old_values, new_values, changed_by, request_id, changed_at
+           FROM cart.settings_audit
+          WHERE scope = $1
+          ORDER BY version DESC, changed_at DESC
+          LIMIT $2`
+      : `SELECT id, scope, version, old_values, new_values, changed_by, request_id, changed_at
+           FROM cart.settings_audit
+          ORDER BY version DESC, changed_at DESC
+          LIMIT $1`;
+    const params = scope ? [scope, limit] : [limit];
+
+    const { rows } = await getPool().query<SettingsAuditRow>(query, params);
+
+    return rows.map((r) => ({
+      id: r.id,
+      scope: r.scope,
+      version: r.version,
+      oldValues: r.old_values,
+      newValues: r.new_values,
+      changedBy: r.changed_by,
+      requestId: r.request_id,
+      changedAt:
+        r.changed_at instanceof Date
+          ? r.changed_at.toISOString()
+          : new Date(r.changed_at).toISOString(),
+    }));
   }
 
   async save(input: SaveSettingsInput): Promise<SaveSettingsResult> {
