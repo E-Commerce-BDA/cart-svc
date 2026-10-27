@@ -68,6 +68,11 @@ describe('Cart Security & Audit (e2e)', () => {
           WHERE user_id = ANY($1::uuid[])`,
         [[adminId, customerId, victimId]],
       );
+      await pool.query(
+        `DELETE FROM cart.settings_audit
+          WHERE changed_by = $1`,
+        [adminId],
+      );
     }
 
     if (app) {
@@ -175,31 +180,12 @@ describe('Cart Security & Audit (e2e)', () => {
     });
 
     it('allows admin to retrieve audit log entries with 200 OK', async () => {
-      let updated = false;
-      for (let attempt = 0; attempt < 5 && !updated; attempt++) {
-        const current = await request(app.getHttpServer())
-          .get('/api/v1/cart/settings')
-          .set('Authorization', `Bearer ${adminToken}`);
-
-        const newStrategy =
-          current.body.values?.guestMergeStrategy === 'merge'
-            ? 'user_wins'
-            : 'merge';
-
-        const patchRes = await request(app.getHttpServer())
-          .patch('/api/v1/cart/settings')
-          .set('Authorization', `Bearer ${adminToken}`)
-          .send({
-            version: current.body.version,
-            values: { guestMergeStrategy: newStrategy },
-          });
-
-        if (patchRes.status === 200) {
-          updated = true;
-        } else {
-          await new Promise((r) => setTimeout(r, 50));
-        }
-      }
+      // Seed a test audit row directly to avoid mutating shared cart.settings version concurrently
+      await pool.query(
+        `INSERT INTO cart.settings_audit (scope, version, old_values, new_values, changed_by, request_id)
+         VALUES ('global', 9999, '{"guestMergeStrategy": "merge"}'::jsonb, '{"guestMergeStrategy": "user_wins"}'::jsonb, $1, 'req-sec-audit')`,
+        [adminId],
+      );
 
       const auditRes = await request(app.getHttpServer())
         .get('/api/v1/cart/settings/audit')
@@ -210,10 +196,13 @@ describe('Cart Security & Audit (e2e)', () => {
       expect(Array.isArray(auditRes.body.entries)).toBe(true);
       expect(auditRes.body.entries.length).toBeGreaterThan(0);
 
-      const latest = auditRes.body.entries[0];
-      expect(latest.scope).toBe('global');
-      expect(latest.newValues).toBeDefined();
-      expect(latest.changedAt).toBeDefined();
+      const found = auditRes.body.entries.find(
+        (e: { changedBy: string | null }) => e.changedBy === adminId,
+      );
+      expect(found).toBeDefined();
+      expect(found.scope).toBe('global');
+      expect(found.newValues).toBeDefined();
+      expect(found.changedAt).toBeDefined();
       expect(auditRes.headers['cache-control']).toBe('no-store');
       expect(auditRes.headers['vary']).toBe('Authorization');
     });
