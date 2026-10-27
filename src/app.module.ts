@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { HealthService } from './health/health.service.js';
 import { HealthController } from './health/health.controller.js';
+import { CartModule } from './cart/cart.module.js';
 import Joi from 'joi';
 
 @Module({
@@ -14,6 +15,7 @@ import Joi from 'joi';
         JWT_SECRET: Joi.string().min(32).required(),
       }),
     }),
+    CartModule,
   ],
   controllers: [HealthController],
   providers: [HealthService],
