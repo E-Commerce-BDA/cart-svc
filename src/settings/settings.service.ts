@@ -4,7 +4,11 @@ import {
   Injectable,
   InternalServerErrorException,
 } from '@nestjs/common';
-import { SettingsRepository, SettingsRow } from './settings.repository.js';
+import {
+  SettingsAuditEntry,
+  SettingsRepository,
+  SettingsRow,
+} from './settings.repository.js';
 import {
   getSettingDefinitions,
   isSettingKey,
@@ -42,6 +46,10 @@ export interface SettingsResponse extends SettingsDocument {
   definitions: SettingDefinitionDto[];
 }
 
+export interface SettingsAuditResponse {
+  entries: SettingsAuditEntry[];
+}
+
 @Injectable()
 export class SettingsService {
   constructor(private readonly repository: SettingsRepository) {}
@@ -52,6 +60,14 @@ export class SettingsService {
       ...this.toDocument(row),
       definitions: getSettingDefinitions(),
     };
+  }
+
+  async getAuditEntries(limit: number = 50): Promise<SettingsAuditResponse> {
+    const entries = await this.repository.findAuditEntries(
+      SETTINGS_SCOPE,
+      limit,
+    );
+    return { entries };
   }
 
   async getGuestMergeStrategy(): Promise<GuestMergeStrategy> {
