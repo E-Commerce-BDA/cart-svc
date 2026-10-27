@@ -15,6 +15,7 @@ import { RolesGuard } from '../auth/guards/roles.guard.js';
 import { getRequestId } from '../common/http/request-id.js';
 import { UpdateSettingsDto } from './dto/update-settings.dto.js';
 import {
+  SettingsAuditResponse,
   SettingsDocument,
   SettingsResponse,
   SettingsService,
@@ -25,6 +26,13 @@ import {
 @Roles('admin')
 export class SettingsController {
   constructor(private readonly settingsService: SettingsService) {}
+
+  @Get('audit')
+  @Header('Cache-Control', 'no-store')
+  @Header('Vary', 'Authorization')
+  getAudit(): Promise<SettingsAuditResponse> {
+    return this.settingsService.getAuditEntries();
+  }
 
   @Get()
   @Header('Cache-Control', 'no-store')
