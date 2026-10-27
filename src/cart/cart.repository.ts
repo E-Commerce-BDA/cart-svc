@@ -438,6 +438,7 @@ export class CartRepository {
       `UPDATE cart.carts
           SET last_activity_at = now()
         WHERE id = $1
+          AND status = 'active'
         RETURNING ${CART_COLUMNS}`,
       [cartId],
     );
