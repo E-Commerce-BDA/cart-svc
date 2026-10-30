@@ -18,6 +18,7 @@ describe('CartService', () => {
   let deleteItem: ReturnType<typeof vi.fn>;
   let deleteItems: ReturnType<typeof vi.fn>;
   let clearItems: ReturnType<typeof vi.fn>;
+  let convertActiveCart: ReturnType<typeof vi.fn>;
   let catalogGetProduct: ReturnType<typeof vi.fn>;
   let publish: ReturnType<typeof vi.fn>;
   let service: CartService;
@@ -45,6 +46,7 @@ describe('CartService', () => {
     deleteItem = vi.fn();
     deleteItems = vi.fn();
     clearItems = vi.fn();
+    convertActiveCart = vi.fn();
     catalogGetProduct = vi.fn();
     publish = vi.fn();
 
@@ -57,6 +59,7 @@ describe('CartService', () => {
       deleteItem,
       deleteItems,
       clearItems,
+      convertActiveCart,
     } as unknown as CartRepository;
     const catalog = {
       getProduct: catalogGetProduct,
@@ -191,6 +194,44 @@ describe('CartService', () => {
     await service.removeItem(identity, 'item-1');
 
     expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  describe('convertCart', () => {
+    const userCart: CartRow = {
+      ...cart,
+      user_id: '11111111-1111-4111-8111-111111111111',
+      session_id: null,
+      status: 'converted',
+      last_activity_at: new Date('2026-10-30T10:00:00Z'),
+    };
+
+    it('returns the converted cart and publishes one cart.updated', async () => {
+      convertActiveCart.mockResolvedValue(userCart);
+      findItems.mockResolvedValue([item({ qty: 2 })]);
+
+      const result = await service.convertCart(userCart.user_id!);
+
+      expect(convertActiveCart).toHaveBeenCalledWith(userCart.user_id);
+      expect(result).toEqual({
+        cartId: userCart.id,
+        convertedAt: '2026-10-30T10:00:00.000Z',
+      });
+      expect(publish).toHaveBeenCalledTimes(1);
+      expect(publish.mock.calls[0][0]).toMatchObject({
+        cartId: userCart.id,
+        status: 'converted',
+        totals: { subtotal: 159.98, itemCount: 2, lineCount: 1 },
+      });
+    });
+
+    it('returns null and stays silent when there is no active cart', async () => {
+      convertActiveCart.mockResolvedValue(null);
+
+      await expect(service.convertCart(userCart.user_id!)).resolves.toBeNull();
+
+      expect(findItems).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+    });
   });
 
   it('sums quantities and money in cents across lines', () => {

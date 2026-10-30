@@ -16,6 +16,7 @@ import { IdempotencyService } from './idempotency.service.js';
 @Module({
   imports: [AuthModule, RedisModule, SettingsModule],
   controllers: [CartController],
+  exports: [CartService],
   providers: [
     CartService,
     CartMergeService,

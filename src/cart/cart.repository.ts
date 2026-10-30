@@ -207,6 +207,25 @@ export class CartRepository {
     });
   }
 
+  /**
+   * Converts the user's active cart in place. The partial unique index
+   * `one_active_cart_per_user` guarantees at most one row, so the UPDATE needs
+   * neither `FOR UPDATE` nor a transaction. Items stay for audit and analytics.
+   */
+  async convertActiveCart(userId: string): Promise<CartRow | null> {
+    const { rows } = await getPool().query<CartRow>(
+      `UPDATE cart.carts
+          SET status = 'converted',
+              last_activity_at = now()
+        WHERE user_id = $1
+          AND status = 'active'
+        RETURNING ${CART_COLUMNS}`,
+      [userId],
+    );
+
+    return rows[0] ?? null;
+  }
+
   async mergeActiveCarts(
     userId: string,
     sessionId: string,

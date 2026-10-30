@@ -151,6 +151,29 @@ export class CartService {
     }
   }
 
+  /**
+   * Phase-0 conversion bridge for checkout (ca-007). Returns the converted cart
+   * so the caller can log it; `null` means the user had nothing to convert, and
+   * a replay therefore stays silent. Replaced by the `order.created` consumer
+   * in ca-009.
+   */
+  async convertCart(
+    userId: string,
+  ): Promise<{ cartId: string; convertedAt: string } | null> {
+    const cart = await this.repository.convertActiveCart(userId);
+    if (!cart) {
+      return null;
+    }
+
+    const items = await this.repository.findItems(cart.id);
+    this.publishCartUpdated(cart, items, computeTotals(items));
+
+    return {
+      cartId: cart.id,
+      convertedAt: cart.last_activity_at.toISOString(),
+    };
+  }
+
   private async requireActiveCart(identity: CartIdentity): Promise<CartRow> {
     const cart = await this.repository.findActiveCart(identity);
     if (!cart) {
