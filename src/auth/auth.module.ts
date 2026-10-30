@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { CartIdentityGuard } from './guards/cart-identity.guard.js';
 import { JwtAuthGuard } from './guards/jwt-auth.guard.js';
 import { RolesGuard } from './guards/roles.guard.js';
+import { ServiceKeyGuard } from './guards/service-key.guard.js';
 
 @Module({
   imports: [
@@ -14,7 +15,13 @@ import { RolesGuard } from './guards/roles.guard.js';
       }),
     }),
   ],
-  providers: [JwtAuthGuard, RolesGuard, CartIdentityGuard],
-  exports: [JwtModule, JwtAuthGuard, RolesGuard, CartIdentityGuard],
+  providers: [JwtAuthGuard, RolesGuard, CartIdentityGuard, ServiceKeyGuard],
+  exports: [
+    JwtModule,
+    JwtAuthGuard,
+    RolesGuard,
+    CartIdentityGuard,
+    ServiceKeyGuard,
+  ],
 })
 export class AuthModule {}
