@@ -14,8 +14,13 @@ import {
 import { DEFAULT_INTERNAL_SERVICE_KEY } from './../src/auth/guards/service-key.guard.js';
 import { AppModule } from './../src/app.module.js';
 import { closePool, getPool } from './../src/db/pool.js';
-import { EVENT_BUS } from './../src/events/event-bus.js';
-import type { CartUpdatedEvent } from './../src/events/event-bus.js';
+import {
+  cartOutboxRows,
+  cartUpdatedPayload,
+  countCartOutbox,
+  countCartOutboxFor,
+  deleteCartOutbox,
+} from './outbox.helpers.js';
 
 if (!process.env.DATABASE_URL && typeof process.loadEnvFile === 'function') {
   process.loadEnvFile();
@@ -30,10 +35,15 @@ describe('Internal cart conversion (e2e)', () => {
   let shopperToken: string;
   let cartId: string;
 
-  const events: CartUpdatedEvent[] = [];
+  /** Carts this suite mutates; the outbox assertions count these only. */
+  const trackedCartIds: string[] = [];
+
+  async function eventCount(): Promise<number> {
+    return countCartOutboxFor(pool, trackedCartIds);
+  }
 
   beforeAll(async () => {
-    app = await createApp(events);
+    app = await createApp();
 
     const config = app.get(ConfigService);
     const jwt = new JwtService({
@@ -43,10 +53,12 @@ describe('Internal cart conversion (e2e)', () => {
     pool = getPool();
 
     cartId = await seedCart(pool);
+    trackedCartIds.push(cartId);
   });
 
   afterAll(async () => {
     if (pool) {
+      await deleteCartOutbox(pool, trackedCartIds);
       await pool.query(
         `DELETE FROM cart.carts WHERE user_id = ANY($1::uuid[])`,
         [[FRESH_USER, SHOPPER]],
@@ -95,13 +107,14 @@ describe('Internal cart conversion (e2e)', () => {
   });
 
   it('answers 204 when the user has no cart', async () => {
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post(`/api/v1/cart/internal/carts/${FRESH_USER}/convert`)
       .set('x-service-key', DEFAULT_INTERNAL_SERVICE_KEY)
       .expect(204);
 
     expect(response.body).toEqual({});
-    expect(events).toHaveLength(0);
+    expect(await eventCount()).toBe(before);
   });
 
   it('converts the active cart and keeps its items', async () => {
@@ -125,8 +138,10 @@ describe('Internal cart conversion (e2e)', () => {
     );
 
     expect(rows[0]).toEqual({ status: 'converted', lines: 1 });
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
+
+    const outbox = await cartOutboxRows(pool, cartId);
+    expect(outbox).toHaveLength(1);
+    expect(cartUpdatedPayload(outbox[0]!)).toMatchObject({
       cartId,
       userId: SHOPPER,
       status: 'converted',
@@ -140,7 +155,7 @@ describe('Internal cart conversion (e2e)', () => {
       .set('x-service-key', DEFAULT_INTERNAL_SERVICE_KEY)
       .expect(204);
 
-    expect(events).toHaveLength(1);
+    expect(await countCartOutbox(pool, cartId)).toBe(1);
   });
 
   it('hands the next cart read a fresh active cart', async () => {
@@ -152,6 +167,7 @@ describe('Internal cart conversion (e2e)', () => {
     expect(response.body.cart.id).not.toBe(cartId);
     expect(response.body.cart.status).toBe('active');
     expect(response.body.items).toEqual([]);
+    trackedCartIds.push(response.body.cart.id);
 
     const { rows } = await pool.query<{ status: string }>(
       `SELECT status FROM cart.carts WHERE id = $1`,
@@ -179,17 +195,10 @@ describe('Internal cart conversion (e2e)', () => {
   }
 });
 
-async function createApp(
-  events: CartUpdatedEvent[],
-): Promise<INestApplication<App>> {
+async function createApp(): Promise<INestApplication<App>> {
   const moduleFixture = await Test.createTestingModule({
     imports: [AppModule],
-  })
-    .overrideProvider(EVENT_BUS)
-    .useValue({
-      publish: (event: CartUpdatedEvent) => events.push(event),
-    })
-    .compile();
+  }).compile();
 
   const app = moduleFixture.createNestApplication();
   app.setGlobalPrefix('/api/v1', {

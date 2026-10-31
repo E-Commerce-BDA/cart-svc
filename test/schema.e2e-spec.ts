@@ -30,7 +30,7 @@ describe('Cart Schema (e2e)', () => {
     await closePool();
   });
 
-  it('1. 6 base tables exist in cart schema', async () => {
+  it('1. 7 base tables exist in cart schema', async () => {
     const { rows } = await client.query<{ table_name: string }>(
       `SELECT table_name 
        FROM information_schema.tables 
@@ -42,6 +42,7 @@ describe('Cart Schema (e2e)', () => {
     expect(tableNames).toEqual([
       'cart_items',
       'carts',
+      'outbox',
       'settings',
       'settings_audit',
       'wishlist_items',
@@ -68,6 +69,7 @@ describe('Cart Schema (e2e)', () => {
       'wishlist_items_unique',
       'idx_cart_settings_audit_scope_changed_at',
       'idx_cart_settings_audit_changed_by',
+      'idx_outbox_pending',
     ];
 
     for (const expected of expectedIndexes) {
@@ -316,5 +318,64 @@ describe('Cart Schema (e2e)', () => {
       [sessionId],
     );
     expect(abandoned.rows[0].id).toBeDefined();
+  });
+
+  it('14. keeps cart.outbox rows consistent with their own envelope', async () => {
+    const aggregateId = randomUUID();
+
+    const envelopeFor = (id: string, type = 'cart.updated'): string =>
+      JSON.stringify({
+        id,
+        type,
+        topic: type,
+        eventType: type,
+        version: 1,
+        timestamp: new Date().toISOString(),
+        producer: 'cart-svc',
+        idempotencyKey: id,
+        payload: { cartId: aggregateId },
+      });
+
+    const insert = (eventId: string, aggregateType: string, envelope: string) =>
+      client.query(
+        `INSERT INTO cart.outbox
+           (event_id, aggregate_type, aggregate_id, event_type, envelope)
+         VALUES ($1, $2, $3, 'cart.updated', $4::jsonb)`,
+        [eventId, aggregateType, aggregateId, envelope],
+      );
+
+    // The happy path: every check passes.
+    const eventId = randomUUID();
+    await insert(eventId, 'cart', envelopeFor(eventId));
+
+    const cases: Array<[string, () => Promise<unknown>, RegExp]> = [
+      [
+        'sp_outbox_aggregate_type',
+        () => insert(randomUUID(), 'user', envelopeFor(randomUUID())),
+        /violates check constraint "outbox_aggregate_type_check"/,
+      ],
+      [
+        'sp_outbox_envelope_type',
+        () => {
+          const other = randomUUID();
+          return insert(other, 'cart', envelopeFor(other, 'user.registered'));
+        },
+        /violates check constraint "outbox_envelope_type_matches"/,
+      ],
+      [
+        'sp_outbox_envelope_id',
+        () => insert(randomUUID(), 'cart', envelopeFor(randomUUID())),
+        /violates check constraint "outbox_envelope_id_matches"/,
+      ],
+    ];
+
+    for (const [savepoint, attempt, pattern] of cases) {
+      await client.query(`SAVEPOINT ${savepoint}`);
+      try {
+        await expect(attempt()).rejects.toThrow(pattern);
+      } finally {
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      }
+    }
   });
 });

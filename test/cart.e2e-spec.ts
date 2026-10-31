@@ -20,9 +20,13 @@ import {
   FIXTURE_PRODUCTS,
 } from './../src/cart/catalog.client.js';
 import { closePool, getPool } from './../src/db/pool.js';
-import { EVENT_BUS } from './../src/events/event-bus.js';
-import type { CartUpdatedEvent } from './../src/events/event-bus.js';
 import { RedisService } from './../src/redis/redis.service.js';
+import {
+  cartOutboxRowsFor,
+  countCartOutboxFor,
+  deleteCartOutbox,
+  type CartOutboxRow,
+} from './outbox.helpers.js';
 
 if (!process.env.DATABASE_URL && typeof process.loadEnvFile === 'function') {
   process.loadEnvFile();
@@ -42,12 +46,34 @@ describe('Cart CRUD (e2e)', () => {
   let teeItemId: string;
   let mugItemId: string;
 
-  const events: CartUpdatedEvent[] = [];
   const userIds = [randomUUID(), randomUUID()];
   const guestSessions = [`guest-${randomUUID()}`, `guest-${randomUUID()}`];
+  /** Every cart this suite touches; the outbox assertions count these only. */
+  const trackedCartIds: string[] = [];
+
+  /** The old in-process spy, replaced by the rows `cart.outbox` holds. */
+  async function eventCount(): Promise<number> {
+    return countCartOutboxFor(pool, trackedCartIds);
+  }
+
+  async function lastEvent(): Promise<CartOutboxRow> {
+    const rows = await cartOutboxRowsFor(pool, trackedCartIds);
+    const last = rows.at(-1);
+    if (!last) {
+      throw new Error('expected at least one cart.outbox row');
+    }
+    return last;
+  }
+
+  function track(cartId: string): string {
+    if (!trackedCartIds.includes(cartId)) {
+      trackedCartIds.push(cartId);
+    }
+    return cartId;
+  }
 
   beforeAll(async () => {
-    app = await createApp(events);
+    app = await createApp();
 
     const config = app.get(ConfigService);
     const jwt = new JwtService({
@@ -61,6 +87,7 @@ describe('Cart CRUD (e2e)', () => {
 
   afterAll(async () => {
     if (pool) {
+      await deleteCartOutbox(pool, trackedCartIds);
       await pool.query(
         `DELETE FROM cart.carts
           WHERE user_id = ANY($1::uuid[])
@@ -116,7 +143,7 @@ describe('Cart CRUD (e2e)', () => {
       .set('x-session-id', guestSessions[0])
       .expect(200);
 
-    guestCartId = first.body.cart.id;
+    guestCartId = track(first.body.cart.id);
     expect(first.body.cart).toMatchObject({
       userId: null,
       sessionId: guestSessions[0],
@@ -143,6 +170,7 @@ describe('Cart CRUD (e2e)', () => {
       .set('Cookie', `x-session-id=${guestSessions[1]}`)
       .expect(200);
 
+    track(response.body.cart.id);
     expect(response.body.cart).toMatchObject({
       userId: null,
       sessionId: guestSessions[1],
@@ -156,6 +184,7 @@ describe('Cart CRUD (e2e)', () => {
       .set('Authorization', `Bearer ${userAToken}`)
       .expect(200);
 
+    track(response.body.cart.id);
     expect(response.body.cart).toMatchObject({
       userId: userIds[0],
       sessionId: null,
@@ -164,7 +193,7 @@ describe('Cart CRUD (e2e)', () => {
   });
 
   it('requires an idempotency key on mutations', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -176,11 +205,11 @@ describe('Cart CRUD (e2e)', () => {
       .expect(400);
 
     expect(response.body.error.code).toBe('VALIDATION_FAILED');
-    expect(events).toHaveLength(before);
+    expect(await eventCount()).toBe(before);
   });
 
   it('adds a catalog snapshot and computes totals', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -209,8 +238,8 @@ describe('Cart CRUD (e2e)', () => {
       lineCount: 1,
     });
 
-    expect(events).toHaveLength(before + 1);
-    expect(events[events.length - 1]).toMatchObject({
+    expect(await eventCount()).toBe(before + 1);
+    expect((await lastEvent()).envelope.payload).toMatchObject({
       cartId: guestCartId,
       sessionId: guestSessions[0],
       userId: null,
@@ -219,7 +248,7 @@ describe('Cart CRUD (e2e)', () => {
   });
 
   it('replays an identical mutation without adding a second line or event', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -233,7 +262,7 @@ describe('Cart CRUD (e2e)', () => {
 
     expect(response.body.item.id).toBe(teeItemId);
     expect(response.body.item.qty).toBe(2);
-    expect(events).toHaveLength(before);
+    expect(await eventCount()).toBe(before);
 
     const cart = await getCart(guestSessions[0]);
     expect(cart.body.items).toHaveLength(1);
@@ -241,7 +270,7 @@ describe('Cart CRUD (e2e)', () => {
   });
 
   it('rejects reuse of an idempotency key with a different body', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -254,11 +283,11 @@ describe('Cart CRUD (e2e)', () => {
       .expect(409);
 
     expect(response.body.error.code).toBe('IDEMPOTENCY_CONFLICT');
-    expect(events).toHaveLength(before);
+    expect(await eventCount()).toBe(before);
   });
 
   it('increments an existing line when the same product is added with a new key', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -277,11 +306,11 @@ describe('Cart CRUD (e2e)', () => {
       itemCount: 3,
       lineCount: 1,
     });
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
   });
 
   it('adds a second product and reports both lines', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -298,11 +327,11 @@ describe('Cart CRUD (e2e)', () => {
       itemCount: 5,
       lineCount: 2,
     });
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
   });
 
   it('updates a quantity and keeps totals consistent', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .patch(`/api/v1/cart/items/${teeItemId}`)
       .set('x-session-id', guestSessions[0])
@@ -319,7 +348,7 @@ describe('Cart CRUD (e2e)', () => {
       itemCount: 3,
       lineCount: 2,
     });
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
   });
 
   it('returns 404 for an item owned by another user', async () => {
@@ -330,7 +359,9 @@ describe('Cart CRUD (e2e)', () => {
       .send({ productId: MUG.productId, qty: 1 })
       .expect(201);
 
-    const before = events.length;
+    // User B's cart is mutated by this suite, so its rows count as ours.
+    track(await userCartId(userBToken));
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .patch(`/api/v1/cart/items/${add.body.item.id}`)
       .set('Authorization', `Bearer ${userAToken}`)
@@ -339,7 +370,7 @@ describe('Cart CRUD (e2e)', () => {
       .expect(404);
 
     expect(response.body.error.code).toBe('CART_ITEM_NOT_FOUND');
-    expect(events).toHaveLength(before);
+    expect(await eventCount()).toBe(before);
   });
 
   it('returns 404 for an item owned by another guest session', async () => {
@@ -350,7 +381,7 @@ describe('Cart CRUD (e2e)', () => {
       .send({ productId: MUG.productId, qty: 1 })
       .expect(201);
 
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .patch(`/api/v1/cart/items/${add.body.item.id}`)
       .set('x-session-id', guestSessions[0])
@@ -359,18 +390,18 @@ describe('Cart CRUD (e2e)', () => {
       .expect(404);
 
     expect(response.body.error.code).toBe('CART_ITEM_NOT_FOUND');
-    expect(events).toHaveLength(before);
+    expect(await eventCount()).toBe(before);
   });
 
   it('removes one item, replays the 204, and emits once', async () => {
-    const before = events.length;
+    const before = await eventCount();
     await request(app.getHttpServer())
       .delete(`/api/v1/cart/items/${teeItemId}`)
       .set('x-session-id', guestSessions[0])
       .set('x-idempotency-key', key('remove-tee'))
       .expect(204);
 
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
 
     const replay = await request(app.getHttpServer())
       .delete(`/api/v1/cart/items/${teeItemId}`)
@@ -379,7 +410,7 @@ describe('Cart CRUD (e2e)', () => {
       .expect(204);
 
     expect(replay.text).toBe('');
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
 
     const cart = await getCart(guestSessions[0]);
     expect(cart.body.items).toHaveLength(1);
@@ -403,7 +434,7 @@ describe('Cart CRUD (e2e)', () => {
       })
       .expect(201);
 
-    const before = events.length;
+    const before = await eventCount();
     await request(app.getHttpServer())
       .delete('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -411,7 +442,7 @@ describe('Cart CRUD (e2e)', () => {
       .send({ ids: [mugItemId, randomUUID()] })
       .expect(204);
 
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
 
     const cart = await getCart(guestSessions[0]);
     expect(cart.body.items).toHaveLength(1);
@@ -422,7 +453,7 @@ describe('Cart CRUD (e2e)', () => {
       lineCount: 1,
     });
 
-    const beforeForeign = events.length;
+    const beforeForeign = await eventCount();
     const foreign = await request(app.getHttpServer())
       .delete('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -431,18 +462,18 @@ describe('Cart CRUD (e2e)', () => {
       .expect(404);
 
     expect(foreign.body.error.code).toBe('CART_ITEM_NOT_FOUND');
-    expect(events).toHaveLength(beforeForeign);
+    expect(await eventCount()).toBe(beforeForeign);
   });
 
   it('clears the cart, replays the 204, and emits once', async () => {
-    const before = events.length;
+    const before = await eventCount();
     await request(app.getHttpServer())
       .delete('/api/v1/cart')
       .set('x-session-id', guestSessions[0])
       .set('x-idempotency-key', key('clear-cart'))
       .expect(204);
 
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
 
     await request(app.getHttpServer())
       .delete('/api/v1/cart')
@@ -450,7 +481,7 @@ describe('Cart CRUD (e2e)', () => {
       .set('x-idempotency-key', key('clear-cart'))
       .expect(204);
 
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount()).toBe(before + 1);
 
     const cart = await getCart(guestSessions[0]);
     expect(cart.body.items).toEqual([]);
@@ -462,7 +493,7 @@ describe('Cart CRUD (e2e)', () => {
   });
 
   it('rejects an unavailable product with 422 and no event', async () => {
-    const before = events.length;
+    const before = await eventCount();
     const response = await request(app.getHttpServer())
       .post('/api/v1/cart/items')
       .set('x-session-id', guestSessions[0])
@@ -471,12 +502,12 @@ describe('Cart CRUD (e2e)', () => {
       .expect(422);
 
     expect(response.body.error.code).toBe('CART_PRODUCT_UNAVAILABLE');
-    expect(events).toHaveLength(before);
+    expect(await eventCount()).toBe(before);
   });
 
   it('fails closed with 503 when Redis is unavailable', async () => {
-    const downEvents: CartUpdatedEvent[] = [];
-    const downApp = await createApp(downEvents, true);
+    const before = await eventCount();
+    const downApp = await createApp(true);
 
     try {
       const response = await request(downApp.getHttpServer())
@@ -487,7 +518,7 @@ describe('Cart CRUD (e2e)', () => {
         .expect(503);
 
       expect(response.body.error.code).toBe('SERVICE_UNAVAILABLE');
-      expect(downEvents).toHaveLength(0);
+      expect(await eventCount()).toBe(before);
     } finally {
       await downApp.close();
     }
@@ -499,16 +530,20 @@ describe('Cart CRUD (e2e)', () => {
       .set('x-session-id', sessionId)
       .expect(200);
   }
+
+  async function userCartId(token: string): Promise<string> {
+    const response = await request(app.getHttpServer())
+      .get('/api/v1/cart')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    return response.body.cart.id;
+  }
 });
 
-async function createApp(
-  events: CartUpdatedEvent[],
-  redisDown = false,
-): Promise<INestApplication<App>> {
+async function createApp(redisDown = false): Promise<INestApplication<App>> {
   let builder: TestingModuleBuilder = Test.createTestingModule({
     imports: [AppModule],
-  }).overrideProvider(EVENT_BUS).useValue({
-    publish: (event: CartUpdatedEvent) => events.push(event),
   });
 
   if (redisDown) {

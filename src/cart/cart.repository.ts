@@ -1,15 +1,21 @@
 import { Injectable } from '@nestjs/common';
 import { PoolClient } from 'pg';
+import type { CartUpdatedPayload } from '@ecom/contracts';
+import type { Queryable } from '@ecom/messaging';
 import type { CartIdentity } from '../auth/guards/cart-identity.guard.js';
 import { getPool } from '../db/pool.js';
 import type { GuestMergeStrategy } from '../settings/settings.registry.js';
+import { CartOutbox } from '../outbox/cart-outbox.js';
 import type { CatalogProductSnapshot } from './catalog.client.js';
+
+/** The one payload field the database constrains; kept in the contract's terms. */
+export type CartStatus = CartUpdatedPayload['status'];
 
 export interface CartRow {
   id: string;
   user_id: string | null;
   session_id: string | null;
-  status: string;
+  status: CartStatus;
   last_activity_at: Date;
   created_at: Date;
   updated_at: Date;
@@ -32,6 +38,12 @@ export interface CartItemRow {
 export interface ItemMutation {
   item: CartItemRow;
   cart: CartRow;
+  /**
+   * The items the outbox row was built from, read inside the mutation's
+   * transaction. The service reports totals from these instead of re-reading
+   * the cart after commit, where a concurrent mutation could have landed.
+   */
+  items: CartItemRow[];
 }
 
 export interface DeleteMutation {
@@ -49,6 +61,8 @@ const ITEM_COLUMNS = `id, cart_id, product_id, variant_id, qty, unit_price, prod
 
 @Injectable()
 export class CartRepository {
+  constructor(private readonly outbox: CartOutbox) {}
+
   async findActiveCart(identity: CartIdentity): Promise<CartRow | null> {
     const column = identity.type === 'user' ? 'user_id' : 'session_id';
     const value =
@@ -87,8 +101,19 @@ export class CartRepository {
     }
   }
 
-  async findItems(cartId: string): Promise<CartItemRow[]> {
-    const { rows } = await getPool().query<CartItemRow>(
+  /**
+   * `client` is optional so the read-only paths keep using the pool, while a
+   * mutation passes its transaction client to read the same snapshot the
+   * outbox payload will describe.
+   *
+   * The structural `Queryable` port deliberately erases row types, so the
+   * result is asserted here rather than widening the port for `pg`.
+   */
+  async findItems(
+    cartId: string,
+    client: Queryable = getPool(),
+  ): Promise<CartItemRow[]> {
+    const { rows } = await client.query(
       `SELECT ${ITEM_COLUMNS}
          FROM cart.cart_items
         WHERE cart_id = $1
@@ -96,7 +121,7 @@ export class CartRepository {
       [cartId],
     );
 
-    return rows;
+    return rows as CartItemRow[];
   }
 
   async addItem(
@@ -127,7 +152,8 @@ export class CartRepository {
       );
 
       const cart = await this.touchCart(client, cartId);
-      return { item: rows[0], cart };
+      const items = await this.record(client, cart);
+      return { item: rows[0], cart, items };
     });
   }
 
@@ -151,7 +177,8 @@ export class CartRepository {
       }
 
       const cart = await this.touchCart(client, cartId);
-      return { item: rows[0], cart };
+      const items = await this.record(client, cart);
+      return { item: rows[0], cart, items };
     });
   }
 
@@ -171,7 +198,9 @@ export class CartRepository {
         return null;
       }
 
-      return this.touchCart(client, cartId);
+      const cart = await this.touchCart(client, cartId);
+      await this.record(client, cart);
+      return cart;
     });
   }
 
@@ -190,6 +219,7 @@ export class CartRepository {
       }
 
       const cart = await this.touchCart(client, cartId);
+      await this.record(client, cart);
       return { deletedCount, cart };
     });
   }
@@ -202,6 +232,8 @@ export class CartRepository {
         [cartId],
       );
       const cart = await this.touchCart(client, cartId);
+      // A clear of an already-empty cart is still a state change, so it records.
+      await this.record(client, cart);
 
       return { deletedCount: rowCount ?? 0, cart };
     });
@@ -209,21 +241,30 @@ export class CartRepository {
 
   /**
    * Converts the user's active cart in place. The partial unique index
-   * `one_active_cart_per_user` guarantees at most one row, so the UPDATE needs
-   * neither `FOR UPDATE` nor a transaction. Items stay for audit and analytics.
+   * `one_active_cart_per_user` guarantees at most one row, but the items must be
+   * read against the same snapshot as the status change, so this is a
+   * transaction: `UPDATE ... RETURNING` then read items then record.
    */
   async convertActiveCart(userId: string): Promise<CartRow | null> {
-    const { rows } = await getPool().query<CartRow>(
-      `UPDATE cart.carts
-          SET status = 'converted',
-              last_activity_at = now()
-        WHERE user_id = $1
-          AND status = 'active'
-        RETURNING ${CART_COLUMNS}`,
-      [userId],
-    );
+    return this.withTransaction(async (client) => {
+      const { rows } = await client.query<CartRow>(
+        `UPDATE cart.carts
+            SET status = 'converted',
+                last_activity_at = now()
+          WHERE user_id = $1
+            AND status = 'active'
+          RETURNING ${CART_COLUMNS}`,
+        [userId],
+      );
 
-    return rows[0] ?? null;
+      const cart = rows[0];
+      if (!cart) {
+        return null;
+      }
+
+      await this.record(client, cart);
+      return cart;
+    });
   }
 
   async mergeActiveCarts(
@@ -301,6 +342,7 @@ export class CartRepository {
           guestCart.id,
           userId,
         );
+        await this.record(client, adopted);
         return { cart: adopted, changed: true };
       }
 
@@ -313,6 +355,7 @@ export class CartRepository {
 
       await this.convertCart(client, guestCart.id);
       const touched = await this.touchCart(client, target.id);
+      await this.record(client, touched);
       return { cart: touched, changed: true };
     });
   }
@@ -468,6 +511,20 @@ export class CartRepository {
     }
 
     return cart;
+  }
+
+  /**
+   * Reads the post-mutation items and writes the `cart.updated` row, both
+   * inside the caller's transaction. Every mutating method funnels through
+   * here, so "one committed mutation, one outbox row" holds by construction.
+   */
+  private async record(
+    client: PoolClient,
+    cart: CartRow,
+  ): Promise<CartItemRow[]> {
+    const items = await this.findItems(cart.id, client);
+    await this.outbox.record(client, cart, items);
+    return items;
   }
 
   private async withTransaction<T>(

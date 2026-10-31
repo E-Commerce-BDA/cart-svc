@@ -1,4 +1,4 @@
-import type { CartUpdatedEvent } from '../events/event-bus.js';
+import type { CartUpdatedPayload } from '@ecom/contracts';
 import type { CartItemRow, CartRow } from './cart.repository.js';
 import type { CartDto, CartItemDto, CartTotals } from './cart.types.js';
 
@@ -46,11 +46,15 @@ export function computeTotals(items: CartItemRow[]): CartTotals {
   };
 }
 
+/**
+ * The `cart.updated` payload. Typed as the contract's payload (not a local
+ * interface) so a field the contract drops or renames fails to compile here.
+ */
 export function buildCartUpdatedEvent(
   cart: CartRow,
   items: CartItemRow[],
   totals: CartTotals,
-): CartUpdatedEvent {
+): CartUpdatedPayload {
   return {
     cartId: cart.id,
     userId: cart.user_id,

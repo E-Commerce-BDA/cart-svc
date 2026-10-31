@@ -19,6 +19,8 @@ import Joi from 'joi';
         PORT: Joi.number().default(4030),
         DATABASE_URL: Joi.string().uri().required(),
         JWT_SECRET: Joi.string().min(32).required(),
+        KAFKA_BROKERS: Joi.string().default('localhost:9092'),
+        DISABLE_OUTBOX_RELAY: Joi.boolean().default(false),
         // The guard's development fallback must be impossible in production.
         INTERNAL_SERVICE_KEY: Joi.string()
           .min(16)

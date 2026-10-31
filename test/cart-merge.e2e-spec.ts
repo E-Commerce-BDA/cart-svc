@@ -18,10 +18,15 @@ import {
 } from './../src/cart/catalog.client.js';
 import type { CatalogProductSnapshot } from './../src/cart/catalog.client.js';
 import { closePool, getPool } from './../src/db/pool.js';
-import { EVENT_BUS } from './../src/events/event-bus.js';
-import type { CartUpdatedEvent } from './../src/events/event-bus.js';
 import { SettingsService } from './../src/settings/settings.service.js';
 import type { GuestMergeStrategy } from './../src/settings/settings.registry.js';
+import {
+  cartOutboxRowsFor,
+  cartUpdatedPayload,
+  countCartOutboxFor,
+  deleteCartOutbox,
+  type CartOutboxRow,
+} from './outbox.helpers.js';
 
 if (!process.env.DATABASE_URL && typeof process.loadEnvFile === 'function') {
   process.loadEnvFile();
@@ -35,6 +40,8 @@ interface Shopper {
   userId: string;
   sessionId: string;
   token: string;
+  /** Every cart this shopper touched, so the outbox assertions can scope to it. */
+  cartIds: string[];
 }
 
 describe('Cart merge (e2e)', () => {
@@ -43,12 +50,37 @@ describe('Cart merge (e2e)', () => {
   let pool: Pool;
   let currentPolicy: GuestMergeStrategy = 'merge';
 
-  const events: CartUpdatedEvent[] = [];
   const userIds: string[] = [];
   const guestSessions: string[] = [];
+  /** Union of every shopper's carts; teardown deletes their rows. */
+  const trackedCartIds: string[] = [];
+
+  /** The rows `cart.outbox` holds for one shopper's carts. */
+  async function eventCount(shopper: Shopper): Promise<number> {
+    return countCartOutboxFor(pool, shopper.cartIds);
+  }
+
+  async function lastEvent(shopper: Shopper): Promise<CartOutboxRow> {
+    const rows = await cartOutboxRowsFor(pool, shopper.cartIds);
+    const last = rows.at(-1);
+    if (!last) {
+      throw new Error('expected at least one cart.outbox row');
+    }
+    return last;
+  }
+
+  function track(shopper: Shopper, cartId: string): string {
+    if (!shopper.cartIds.includes(cartId)) {
+      shopper.cartIds.push(cartId);
+    }
+    if (!trackedCartIds.includes(cartId)) {
+      trackedCartIds.push(cartId);
+    }
+    return cartId;
+  }
 
   beforeAll(async () => {
-    app = await createApp(events, () => currentPolicy);
+    app = await createApp(() => currentPolicy);
 
     const config = app.get(ConfigService);
     jwt = new JwtService({
@@ -59,11 +91,11 @@ describe('Cart merge (e2e)', () => {
 
   beforeEach(() => {
     currentPolicy = 'merge';
-    events.length = 0;
   });
 
   afterAll(async () => {
     if (pool) {
+      await deleteCartOutbox(pool, trackedCartIds);
       await pool.query(
         `DELETE FROM cart.carts
           WHERE user_id = ANY($1::uuid[])
@@ -90,7 +122,7 @@ describe('Cart merge (e2e)', () => {
       .expect(400);
 
     expect(response.body.error.code).toBe('VALIDATION_FAILED');
-    expect(events).toHaveLength(0);
+    expect(await eventCount(shopper)).toBe(0);
   });
 
   it('requires x-session-id when the user is verified', async () => {
@@ -104,7 +136,7 @@ describe('Cart merge (e2e)', () => {
       .expect(400);
 
     expect(response.body.error.code).toBe('VALIDATION_FAILED');
-    expect(events).toHaveLength(0);
+    expect(await eventCount(shopper)).toBe(0);
   });
 
   it('rejects a guest-only merge', async () => {
@@ -118,7 +150,7 @@ describe('Cart merge (e2e)', () => {
       .expect(401);
 
     expect(response.body.error.code).toBe('UNAUTHENTICATED');
-    expect(events).toHaveLength(0);
+    expect(await eventCount(shopper)).toBe(0);
   });
 
   it('merge sums matching lines, appends guest-only lines, and retries as a no-op', async () => {
@@ -131,7 +163,7 @@ describe('Cart merge (e2e)', () => {
     await addItem(shopper, MUG, 1, 'merge-guest-mug', 'guest');
 
     currentPolicy = 'merge';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'merge-both').expect(200);
 
     expect(Object.keys(response.body)).toEqual(['cart']);
@@ -141,15 +173,16 @@ describe('Cart merge (e2e)', () => {
       sessionId: null,
       status: 'active',
     });
-    expect(events).toHaveLength(before + 1);
-    expect(events[events.length - 1]).toMatchObject({
+    expect(await eventCount(shopper)).toBe(before + 1);
+    const merged = cartUpdatedPayload(await lastEvent(shopper));
+    expect(merged).toMatchObject({
       cartId: userCart.body.cart.id,
       userId: shopper.userId,
       sessionId: null,
       status: 'active',
       totals: { subtotal: 252.47, itemCount: 4, lineCount: 2 },
     });
-    expect(events[events.length - 1].items).toHaveLength(2);
+    expect(merged.items).toHaveLength(2);
 
     const cart = await getCart(shopper, 'user');
     expect(cart.body.items).toHaveLength(2);
@@ -165,11 +198,11 @@ describe('Cart merge (e2e)', () => {
 
     const replay = await merge(shopper, 'merge-both').expect(200);
     expect(replay.body.cart.id).toBe(userCart.body.cart.id);
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount(shopper)).toBe(before + 1);
 
     const naturalRetry = await merge(shopper, 'merge-both-again').expect(200);
     expect(naturalRetry.body.cart.id).toBe(userCart.body.cart.id);
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount(shopper)).toBe(before + 1);
 
     const afterRetry = await getCart(shopper, 'user');
     expect(findLine(afterRetry.body, TEE.productId, TEE.variantId)?.qty).toBe(
@@ -189,7 +222,7 @@ describe('Cart merge (e2e)', () => {
     await addItem(shopper, MUG, 2, 'null-guest-mug', 'guest');
 
     currentPolicy = 'merge';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'merge-null-variant').expect(200);
 
     expect(response.body.cart.id).toBe(userCart.body.cart.id);
@@ -201,8 +234,10 @@ describe('Cart merge (e2e)', () => {
       itemCount: 3,
       lineCount: 1,
     });
-    expect(events).toHaveLength(before + 1);
-    expect(events[events.length - 1].items).toHaveLength(1);
+    expect(await eventCount(shopper)).toBe(before + 1);
+    expect(
+      cartUpdatedPayload(await lastEvent(shopper)).items,
+    ).toHaveLength(1);
   });
 
   it('guest_wins adopts the guest cart and converts the old user cart', async () => {
@@ -214,7 +249,7 @@ describe('Cart merge (e2e)', () => {
     await addItem(shopper, MUG, 2, 'guest-wins-guest-mug', 'guest');
 
     currentPolicy = 'guest_wins';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'guest-wins').expect(200);
 
     expect(response.body.cart).toMatchObject({
@@ -236,8 +271,8 @@ describe('Cart merge (e2e)', () => {
       itemCount: 2,
       lineCount: 1,
     });
-    expect(events).toHaveLength(before + 1);
-    expect(events[events.length - 1]).toMatchObject({
+    expect(await eventCount(shopper)).toBe(before + 1);
+    expect(cartUpdatedPayload(await lastEvent(shopper))).toMatchObject({
       cartId: guestCart.body.cart.id,
       userId: shopper.userId,
       sessionId: null,
@@ -254,7 +289,7 @@ describe('Cart merge (e2e)', () => {
     await addItem(shopper, MUG, 2, 'user-wins-guest-mug', 'guest');
 
     currentPolicy = 'user_wins';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'user-wins').expect(200);
 
     expect(response.body.cart.id).toBe(userCart.body.cart.id);
@@ -270,8 +305,8 @@ describe('Cart merge (e2e)', () => {
       itemCount: 1,
       lineCount: 1,
     });
-    expect(events).toHaveLength(before + 1);
-    expect(events[events.length - 1]).toMatchObject({
+    expect(await eventCount(shopper)).toBe(before + 1);
+    expect(cartUpdatedPayload(await lastEvent(shopper))).toMatchObject({
       cartId: userCart.body.cart.id,
       userId: shopper.userId,
       sessionId: null,
@@ -286,7 +321,7 @@ describe('Cart merge (e2e)', () => {
     await addItem(shopper, MUG, 2, 'user-wins-empty-guest-mug', 'guest');
 
     currentPolicy = 'user_wins';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'user-wins-empty').expect(200);
 
     expect(response.body.cart).toMatchObject({
@@ -302,7 +337,7 @@ describe('Cart merge (e2e)', () => {
     const cart = await getCart(shopper, 'user');
     expect(cart.body.cart.id).toBe(guestCart.body.cart.id);
     expect(findLine(cart.body, MUG.productId, MUG.variantId)?.qty).toBe(2);
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount(shopper)).toBe(before + 1);
   });
 
   it('merge adopts the guest cart when no user cart exists', async () => {
@@ -311,7 +346,7 @@ describe('Cart merge (e2e)', () => {
     await addItem(shopper, TEE, 1, 'only-guest-tee', 'guest');
 
     currentPolicy = 'merge';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'merge-only-guest').expect(200);
 
     expect(response.body.cart).toMatchObject({
@@ -325,7 +360,7 @@ describe('Cart merge (e2e)', () => {
     const cart = await getCart(shopper, 'user');
     expect(cart.body.cart.id).toBe(guestCart.body.cart.id);
     expect(findLine(cart.body, TEE.productId, TEE.variantId)?.qty).toBe(1);
-    expect(events).toHaveLength(before + 1);
+    expect(await eventCount(shopper)).toBe(before + 1);
   });
 
   it('only-user merge is a no-op with no event', async () => {
@@ -334,12 +369,12 @@ describe('Cart merge (e2e)', () => {
     await addItem(shopper, TEE, 1, 'only-user-tee', 'user');
 
     currentPolicy = 'merge';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'merge-only-user').expect(200);
 
     expect(response.body.cart.id).toBe(userCart.body.cart.id);
     expect(await cartStatus(userCart.body.cart.id)).toBe('active');
-    expect(events).toHaveLength(before);
+    expect(await eventCount(shopper)).toBe(before);
   });
 
   it('both-empty merge keeps the user cart and converts the guest cart', async () => {
@@ -348,13 +383,13 @@ describe('Cart merge (e2e)', () => {
     const guestCart = await getCart(shopper, 'guest');
 
     currentPolicy = 'merge';
-    const before = events.length;
+    const before = await eventCount(shopper);
     const response = await merge(shopper, 'merge-empty').expect(200);
 
     expect(response.body.cart.id).toBe(userCart.body.cart.id);
     expect(await cartStatus(guestCart.body.cart.id)).toBe('converted');
-    expect(events).toHaveLength(before + 1);
-    expect(events[events.length - 1]).toMatchObject({
+    expect(await eventCount(shopper)).toBe(before + 1);
+    expect(cartUpdatedPayload(await lastEvent(shopper))).toMatchObject({
       cartId: userCart.body.cart.id,
       totals: { subtotal: 0, itemCount: 0, lineCount: 0 },
     });
@@ -371,7 +406,7 @@ describe('Cart merge (e2e)', () => {
       sessionId: null,
       status: 'active',
     });
-    expect(events).toHaveLength(0);
+    expect(await eventCount(shopper)).toBe(0);
   });
 
   async function newShopper(): Promise<Shopper> {
@@ -383,14 +418,12 @@ describe('Cart merge (e2e)', () => {
     return {
       userId,
       sessionId,
+      cartIds: [],
       token: await signToken(jwt, userId),
     };
   }
 
-  async function getCart(
-    shopper: Shopper,
-    as: 'user' | 'guest' = 'user',
-  ) {
+  async function getCart(shopper: Shopper, as: 'user' | 'guest' = 'user') {
     const req = request(app.getHttpServer()).get('/api/v1/cart');
 
     if (as === 'user') {
@@ -399,7 +432,9 @@ describe('Cart merge (e2e)', () => {
       req.set('x-session-id', shopper.sessionId);
     }
 
-    return req.expect(200);
+    const response = await req.expect(200);
+    track(shopper, response.body.cart.id);
+    return response;
   }
 
   async function addItem(
@@ -477,16 +512,11 @@ function findLine(
 }
 
 async function createApp(
-  events: CartUpdatedEvent[],
   policy: () => GuestMergeStrategy,
 ): Promise<INestApplication<App>> {
   const builder: TestingModuleBuilder = Test.createTestingModule({
     imports: [AppModule],
   })
-    .overrideProvider(EVENT_BUS)
-    .useValue({
-      publish: (event: CartUpdatedEvent) => events.push(event),
-    })
     .overrideProvider(SettingsService)
     .useValue({
       getGuestMergeStrategy: async () => policy(),

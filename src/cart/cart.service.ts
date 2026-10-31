@@ -1,28 +1,20 @@
 import {
   Inject,
   Injectable,
-  Logger,
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import type { CartIdentity } from '../auth/guards/cart-identity.guard.js';
-import { EVENT_BUS } from '../events/event-bus.js';
-import type { EventBus } from '../events/event-bus.js';
 import { CATALOG_CLIENT } from './catalog.client.js';
 import type { CatalogClient } from './catalog.client.js';
 import {
-  buildCartUpdatedEvent,
   computeTotals,
   toCartDto,
   toItemDto,
 } from './cart.mapper.js';
 import { CartRepository } from './cart.repository.js';
-import type { CartItemRow, CartRow } from './cart.repository.js';
-import type {
-  CartMutationResponse,
-  CartResponse,
-  CartTotals,
-} from './cart.types.js';
+import type { CartRow } from './cart.repository.js';
+import type { CartMutationResponse, CartResponse } from './cart.types.js';
 
 export interface AddItemInput {
   productId: string;
@@ -32,12 +24,9 @@ export interface AddItemInput {
 
 @Injectable()
 export class CartService {
-  private readonly logger = new Logger(CartService.name);
-
   constructor(
     private readonly repository: CartRepository,
     @Inject(CATALOG_CLIENT) private readonly catalog: CatalogClient,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
   ) {}
 
   async getCart(identity: CartIdentity): Promise<CartResponse> {
@@ -73,12 +62,13 @@ export class CartService {
       snapshot,
       input.qty,
     );
-    const items = await this.repository.findItems(cart.id);
-    const totals = computeTotals(items);
 
-    this.publishCartUpdated(mutation.cart, items, totals);
-
-    return { item: toItemDto(mutation.item), cartTotals: totals };
+    // Totals come from the mutation's own snapshot, the same one the outbox
+    // payload reports, so the response and the event cannot disagree.
+    return {
+      item: toItemDto(mutation.item),
+      cartTotals: computeTotals(mutation.items),
+    };
   }
 
   async updateItem(
@@ -97,12 +87,10 @@ export class CartService {
       throw itemNotFound();
     }
 
-    const items = await this.repository.findItems(cart.id);
-    const totals = computeTotals(items);
-
-    this.publishCartUpdated(mutation.cart, items, totals);
-
-    return { item: toItemDto(mutation.item), cartTotals: totals };
+    return {
+      item: toItemDto(mutation.item),
+      cartTotals: computeTotals(mutation.items),
+    };
   }
 
   async removeItem(identity: CartIdentity, itemId: string): Promise<void> {
@@ -112,11 +100,6 @@ export class CartService {
     if (!updatedCart) {
       throw itemNotFound();
     }
-
-    const items = await this.repository.findItems(cart.id);
-    const totals = computeTotals(items);
-
-    this.publishCartUpdated(updatedCart, items, totals);
   }
 
   async removeItems(identity: CartIdentity, ids: string[]): Promise<void> {
@@ -129,11 +112,6 @@ export class CartService {
     if (result.deletedCount === 0 || !result.cart) {
       throw itemNotFound();
     }
-
-    const items = await this.repository.findItems(cart.id);
-    const totals = computeTotals(items);
-
-    this.publishCartUpdated(result.cart, items, totals);
   }
 
   async clearCart(identity: CartIdentity): Promise<void> {
@@ -142,13 +120,7 @@ export class CartService {
       return;
     }
 
-    const result = await this.repository.clearItems(cart.id);
-    const items = await this.repository.findItems(cart.id);
-    const totals = computeTotals(items);
-
-    if (result.cart) {
-      this.publishCartUpdated(result.cart, items, totals);
-    }
+    await this.repository.clearItems(cart.id);
   }
 
   /**
@@ -165,9 +137,6 @@ export class CartService {
       return null;
     }
 
-    const items = await this.repository.findItems(cart.id);
-    this.publishCartUpdated(cart, items, computeTotals(items));
-
     return {
       cartId: cart.id,
       convertedAt: cart.last_activity_at.toISOString(),
@@ -180,21 +149,6 @@ export class CartService {
       throw itemNotFound();
     }
     return cart;
-  }
-
-  private publishCartUpdated(
-    cart: CartRow,
-    items: CartItemRow[],
-    totals: CartTotals,
-  ): void {
-    const event = buildCartUpdatedEvent(cart, items, totals);
-
-    try {
-      this.eventBus.publish(event);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Could not publish cart.updated: ${detail}`);
-    }
   }
 }
 

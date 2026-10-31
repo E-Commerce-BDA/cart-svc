@@ -1,5 +1,4 @@
 import type { CartIdentity } from '../auth/guards/cart-identity.guard.js';
-import type { EventBus } from '../events/event-bus.js';
 import type { CatalogClient } from './catalog.client.js';
 import { FIXTURE_PRODUCTS } from './catalog.client.js';
 import type { CartRepository, CartItemRow, CartRow } from './cart.repository.js';
@@ -20,7 +19,6 @@ describe('CartService', () => {
   let clearItems: ReturnType<typeof vi.fn>;
   let convertActiveCart: ReturnType<typeof vi.fn>;
   let catalogGetProduct: ReturnType<typeof vi.fn>;
-  let publish: ReturnType<typeof vi.fn>;
   let service: CartService;
 
   const identity: CartIdentity = {
@@ -48,7 +46,6 @@ describe('CartService', () => {
     clearItems = vi.fn();
     convertActiveCart = vi.fn();
     catalogGetProduct = vi.fn();
-    publish = vi.fn();
 
     const repository = {
       ensureActiveCart,
@@ -64,12 +61,11 @@ describe('CartService', () => {
     const catalog = {
       getProduct: catalogGetProduct,
     } as unknown as CatalogClient;
-    const eventBus = { publish } as unknown as EventBus;
 
-    service = new CartService(repository, catalog, eventBus);
+    service = new CartService(repository, catalog);
   });
 
-  it('returns items and cent-accurate totals without emitting an event', async () => {
+  it('returns items and cent-accurate totals', async () => {
     ensureActiveCart.mockResolvedValue(cart);
     findItems.mockResolvedValue([item({ qty: 2 })]);
 
@@ -85,7 +81,6 @@ describe('CartService', () => {
       itemCount: 2,
       lineCount: 1,
     });
-    expect(publish).not.toHaveBeenCalled();
   });
 
   it('rejects an unavailable catalog product before touching the cart', async () => {
@@ -97,14 +92,13 @@ describe('CartService', () => {
       response: { code: 'CART_PRODUCT_UNAVAILABLE' },
     });
     expect(ensureActiveCart).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
+    expect(addItem).not.toHaveBeenCalled();
   });
 
-  it('snapshots the catalog product and emits one event on add', async () => {
+  it('snapshots the catalog product and reports totals from the mutation snapshot', async () => {
     catalogGetProduct.mockResolvedValue(TEE);
     ensureActiveCart.mockResolvedValue(cart);
-    addItem.mockResolvedValue({ item: item({ qty: 2 }), cart });
-    findItems.mockResolvedValue([item({ qty: 2 })]);
+    addItem.mockResolvedValue({ item: item({ qty: 2 }), cart, items: [item({ qty: 2 })] });
 
     const result = await service.addItem(identity, {
       productId: TEE.productId,
@@ -128,18 +122,12 @@ describe('CartService', () => {
       itemCount: 2,
       lineCount: 1,
     });
-    expect(publish).toHaveBeenCalledTimes(1);
-    expect(publish).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cartId: cart.id,
-        sessionId: 'guest-session',
-        userId: null,
-        totals: { subtotal: 159.98, itemCount: 2, lineCount: 1 },
-      }),
-    );
+    // The event is written inside the mutation's transaction, so the service
+    // must not re-read the cart after commit.
+    expect(findItems).not.toHaveBeenCalled();
   });
 
-  it('returns 404 and emits nothing for a foreign item update', async () => {
+  it('returns 404 for a foreign item update', async () => {
     findActiveCart.mockResolvedValue(cart);
     updateItemQty.mockResolvedValue(null);
 
@@ -148,10 +136,9 @@ describe('CartService', () => {
     ).rejects.toMatchObject({
       response: { code: 'CART_ITEM_NOT_FOUND' },
     });
-    expect(publish).not.toHaveBeenCalled();
   });
 
-  it('returns 404 and emits nothing when a batch has no owned ids', async () => {
+  it('returns 404 when a batch has no owned ids', async () => {
     findActiveCart.mockResolvedValue(cart);
     deleteItems.mockResolvedValue({ deletedCount: 0, cart: null });
 
@@ -160,7 +147,6 @@ describe('CartService', () => {
     ).rejects.toMatchObject({
       response: { code: 'CART_ITEM_NOT_FOUND' },
     });
-    expect(publish).not.toHaveBeenCalled();
   });
 
   it('treats clearing a missing cart as a no-op', async () => {
@@ -169,31 +155,35 @@ describe('CartService', () => {
     await service.clearCart(identity);
 
     expect(clearItems).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
   });
 
-  it('clears an existing cart and emits one empty-cart event', async () => {
+  it('clears an existing cart', async () => {
     findActiveCart.mockResolvedValue(cart);
     clearItems.mockResolvedValue({ deletedCount: 2, cart });
-    findItems.mockResolvedValue([]);
 
     await service.clearCart(identity);
 
-    expect(publish).toHaveBeenCalledTimes(1);
-    expect(publish.mock.calls[0][0]).toMatchObject({
-      cartId: cart.id,
-      totals: { subtotal: 0, itemCount: 0, lineCount: 0 },
-    });
+    expect(clearItems).toHaveBeenCalledWith(cart.id);
   });
 
-  it('removes one item and emits once', async () => {
+  it('removes one item', async () => {
     findActiveCart.mockResolvedValue(cart);
     deleteItem.mockResolvedValue(cart);
-    findItems.mockResolvedValue([]);
 
     await service.removeItem(identity, 'item-1');
 
-    expect(publish).toHaveBeenCalledTimes(1);
+    expect(deleteItem).toHaveBeenCalledWith(cart.id, 'item-1');
+  });
+
+  it('returns 404 for a foreign item removal', async () => {
+    findActiveCart.mockResolvedValue(cart);
+    deleteItem.mockResolvedValue(null);
+
+    await expect(
+      service.removeItem(identity, 'foreign-item'),
+    ).rejects.toMatchObject({
+      response: { code: 'CART_ITEM_NOT_FOUND' },
+    });
   });
 
   describe('convertCart', () => {
@@ -205,9 +195,8 @@ describe('CartService', () => {
       last_activity_at: new Date('2026-10-30T10:00:00Z'),
     };
 
-    it('returns the converted cart and publishes one cart.updated', async () => {
+    it('returns the converted cart without re-reading its items', async () => {
       convertActiveCart.mockResolvedValue(userCart);
-      findItems.mockResolvedValue([item({ qty: 2 })]);
 
       const result = await service.convertCart(userCart.user_id!);
 
@@ -216,21 +205,13 @@ describe('CartService', () => {
         cartId: userCart.id,
         convertedAt: '2026-10-30T10:00:00.000Z',
       });
-      expect(publish).toHaveBeenCalledTimes(1);
-      expect(publish.mock.calls[0][0]).toMatchObject({
-        cartId: userCart.id,
-        status: 'converted',
-        totals: { subtotal: 159.98, itemCount: 2, lineCount: 1 },
-      });
+      expect(findItems).not.toHaveBeenCalled();
     });
 
-    it('returns null and stays silent when there is no active cart', async () => {
+    it('returns null when there is no active cart', async () => {
       convertActiveCart.mockResolvedValue(null);
 
       await expect(service.convertCart(userCart.user_id!)).resolves.toBeNull();
-
-      expect(findItems).not.toHaveBeenCalled();
-      expect(publish).not.toHaveBeenCalled();
     });
   });
 

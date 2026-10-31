@@ -13,8 +13,10 @@ import {
 } from './../src/auth/auth.constants.js';
 import { AppModule } from './../src/app.module.js';
 import { closePool, getPool } from './../src/db/pool.js';
-import { EVENT_BUS } from './../src/events/event-bus.js';
-import type { CartUpdatedEvent } from './../src/events/event-bus.js';
+import {
+  countCartOutboxFor,
+  deleteCartOutbox,
+} from './outbox.helpers.js';
 
 if (!process.env.DATABASE_URL && typeof process.loadEnvFile === 'function') {
   process.loadEnvFile();
@@ -29,13 +31,12 @@ describe('Cart Security & Audit (e2e)', () => {
   const adminId = randomUUID();
   const customerId = randomUUID();
   const victimId = randomUUID();
-  const events: CartUpdatedEvent[] = [];
+  /** Carts this suite touches; the outbox assertions count these only. */
+  const trackedCartIds: string[] = [];
 
   beforeAll(async () => {
     const builder = Test.createTestingModule({
       imports: [AppModule],
-    }).overrideProvider(EVENT_BUS).useValue({
-      publish: (event: CartUpdatedEvent) => events.push(event),
     });
 
     const moduleFixture = await builder.compile();
@@ -63,6 +64,7 @@ describe('Cart Security & Audit (e2e)', () => {
 
   afterAll(async () => {
     if (pool) {
+      await deleteCartOutbox(pool, trackedCartIds);
       await pool.query(
         `DELETE FROM cart.carts
           WHERE user_id = ANY($1::uuid[])`,
@@ -100,6 +102,7 @@ describe('Cart Security & Audit (e2e)', () => {
 
       expect(res.body.cart.userId).toBe(customerId);
       expect(res.body.cart.userId).not.toBe(victimId);
+      trackedCartIds.push(res.body.cart.id);
     });
   });
 
@@ -216,12 +219,16 @@ describe('Cart Security & Audit (e2e)', () => {
         .expect(200);
 
       const cartId = getRes.body.cart.id;
+      if (!trackedCartIds.includes(cartId)) {
+        trackedCartIds.push(cartId);
+      }
 
       await pool.query(
         `UPDATE cart.carts SET status = 'converted' WHERE id = $1`,
         [cartId],
       );
 
+      const before = await countCartOutboxFor(pool, trackedCartIds);
       const updateRes = await request(app.getHttpServer())
         .patch(`/api/v1/cart/items/${randomUUID()}`)
         .set('Authorization', `Bearer ${customerToken}`)
@@ -230,6 +237,8 @@ describe('Cart Security & Audit (e2e)', () => {
         .expect(404);
 
       expect(updateRes.body.error?.code).toBe('CART_ITEM_NOT_FOUND');
+      // A rejected mutation writes no outbox row: nothing to publish.
+      expect(await countCartOutboxFor(pool, trackedCartIds)).toBe(before);
     });
   });
 });

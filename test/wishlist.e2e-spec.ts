@@ -13,8 +13,6 @@ import {
 } from './../src/auth/auth.constants.js';
 import { AppModule } from './../src/app.module.js';
 import { closePool, getPool } from './../src/db/pool.js';
-import { EVENT_BUS } from './../src/events/event-bus.js';
-import type { CartUpdatedEvent } from './../src/events/event-bus.js';
 
 if (!process.env.DATABASE_URL && typeof process.loadEnvFile === 'function') {
   process.loadEnvFile();
@@ -33,13 +31,9 @@ describe('Wishlist (e2e)', () => {
   const testProductId = randomUUID();
   const testProduct2Id = randomUUID();
 
-  const events: CartUpdatedEvent[] = [];
-
   beforeAll(async () => {
     const builder = Test.createTestingModule({
       imports: [AppModule],
-    }).overrideProvider(EVENT_BUS).useValue({
-      publish: (event: CartUpdatedEvent) => events.push(event),
     });
 
     const moduleFixture = await builder.compile();
@@ -283,8 +277,19 @@ describe('Wishlist (e2e)', () => {
       );
     });
 
-    it('never emits cart.updated events during wishlist operations', () => {
-      expect(events).toHaveLength(0);
+    it('never writes cart.outbox rows for these users', async () => {
+      // Wishlist routes never mutate a cart, so nothing should ever be queued
+      // for publication on their behalf. Scoped by user so a cart mutated by a
+      // parallel spec file cannot make this pass or fail.
+      const { rows } = await pool.query<{ count: string }>(
+        `SELECT count(*) AS count
+           FROM cart.outbox o
+           JOIN cart.carts c ON c.id = o.aggregate_id
+          WHERE c.user_id = ANY($1::uuid[])`,
+        [[customerAId, customerBId, adminId]],
+      );
+
+      expect(Number(rows[0]!.count)).toBe(0);
     });
   });
 });
